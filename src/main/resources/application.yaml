@@ -1,0 +1,30 @@
+spring:
+  application:
+    name: ${SPRING_APPLICATION_NAME :metrics}
+  data:
+    redis:
+      host: ${REDIS_HOST:127.0.0.1}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:authentik}
+      client-type: lettuce
+      lettuce:
+        pool:
+          enabled: false
+server:
+  port: ${SERVER_PORT:8094}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "prometheus"
+  metrics:
+    tags:
+      application: "local-iot-service"
+
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
