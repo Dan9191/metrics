@@ -1,16 +1,22 @@
 package ru.dan.metrics.service;
 
 import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import ru.dan.metrics.model.Event;
 
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class EventProcessor {
@@ -18,12 +24,15 @@ public class EventProcessor {
     private static final int WINDOW_SIZE = 50;
 
     private final RedisTemplate<String, String> redisTemplate;
-
     private final MeterRegistry registry;
 
     private final Counter eventsCounter;
     private final Counter anomaliesCounter;
     private final Timer processingTimer;
+
+    // Фильтр для deviceId, чтобы gauge можно было обновлять
+    private final Map<String, AtomicReference<Double>> rollingAvgGauges = new ConcurrentHashMap<>();
+    private final Map<String, AtomicReference<Double>> zscoreGauges = new ConcurrentHashMap<>();
 
     @Autowired
     public EventProcessor(RedisTemplate<String, String> redisTemplate, MeterRegistry registry) {
@@ -35,15 +44,39 @@ public class EventProcessor {
         this.processingTimer = registry.timer("iot_processing_time");
     }
 
-    public void processEvent(Event event) {
-        processingTimer.record(() -> {
 
+    /** Создаём gauge на метрику (один раз на комбинацию deviceId + metric). */
+    private AtomicReference<Double> initGauge(Map<String, AtomicReference<Double>> map,
+                                              String name,
+                                              String deviceId,
+                                              String metricKey) {
+
+        return map.computeIfAbsent(deviceId + "_" + metricKey, key -> {
+            AtomicReference<Double> ref = new AtomicReference<>(0.0);
+
+            Gauge.builder(name, ref, AtomicReference::get)
+                    .tag("deviceId", deviceId)
+                    .register(registry);
+
+            return ref;
+        });
+    }
+
+
+    public void processEvent(Event event) {
+
+        processingTimer.record(() -> {
             eventsCounter.increment();
+
+            log.info("Received event: deviceId={}, ts={}, temp={}, hum={}",
+                    event.getDeviceId(), event.getTimestamp(),
+                    event.getTemperature(), event.getHumidity());
 
             processMetric(event.getDeviceId(), "temp", event.getTemperature(), event.getTimestamp());
             processMetric(event.getDeviceId(), "hum", event.getHumidity(), event.getTimestamp());
         });
     }
+
 
     private void processMetric(String deviceId, String metric, double value, long ts) {
 
@@ -58,35 +91,43 @@ public class EventProcessor {
             return;
         }
 
-        // Rolling average & z-score
+        // Rolling average + variance
         double sum = 0;
         double sumSq = 0;
         for (String s : raw) {
             double v = Double.parseDouble(s);
             sum += v;
-            sumSq += (v * v);
+            sumSq += v * v;
         }
 
-        int count = raw.size();
-        double mean = sum / count;
-        double variance = (sumSq / count) - (mean * mean);
-        double stddev = variance <= 0 ? 0 : Math.sqrt(variance);
+        int n = raw.size();
+        double avg = sum / n;
+        double variance = (sumSq / n) - (avg * avg);
+        double std = variance <= 0 ? 0 : Math.sqrt(variance);
 
-        double z = stddev == 0 ? 0 : (value - mean) / stddev;
-
+        double z = std == 0 ? 0 : (value - avg) / std;
         if (Math.abs(z) > 3) {
             anomaliesCounter.increment();
         }
 
-        // сохраняем агрегаты
-        String statKey = "device:" + deviceId + ":stat:" + metric;
+        // ------------------------
+        // Обновляем Gauge-метрики
+        // ------------------------
+        AtomicReference<Double> avgGauge =
+                initGauge(rollingAvgGauges, "iot_" + metric + "_rolling_avg", deviceId, metric);
 
-        redisTemplate.opsForHash().put(statKey, "avg", String.valueOf(mean));
+        AtomicReference<Double> zGauge =
+                initGauge(zscoreGauges, "iot_" + metric + "_zscore", deviceId, metric);
+
+        avgGauge.set(avg);
+        zGauge.set(z);
+
+        // ------------------------
+        // Сохраняем агрегаты в Redis
+        // ------------------------
+        String statKey = "device:" + deviceId + ":stat:" + metric;
+        redisTemplate.opsForHash().put(statKey, "avg", String.valueOf(avg));
         redisTemplate.opsForHash().put(statKey, "zscore", String.valueOf(z));
         redisTemplate.opsForHash().put(statKey, "timestamp", String.valueOf(ts));
-
-        // Prometheus gauge
-        registry.gauge("iot_" + metric + "_rolling_avg", mean);
-        registry.gauge("iot_" + metric + "_zscore", z);
     }
 }
