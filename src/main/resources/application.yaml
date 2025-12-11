@@ -17,7 +17,7 @@ management:
   endpoints:
     web:
       exposure:
-        include: "prometheus"
+        include: health, metrics, prometheus
   metrics:
     tags:
       application: "local-iot-service"
